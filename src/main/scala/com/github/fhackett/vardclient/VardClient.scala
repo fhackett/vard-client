@@ -1,7 +1,5 @@
 package com.github.fhackett.vardclient
 
-import com.github.fhackett.vardclient.VardClient.NotLeaderError
-
 import java.math.BigInteger
 import java.net.{InetSocketAddress, SocketException}
 import java.nio.{ByteBuffer, ByteOrder, CharBuffer}
@@ -159,6 +157,8 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
     ByteBuffer.wrap(bytes, 1, bytes.length - 1)
   }
 
+  import VardClient._
+
   private val ResponsePattern = raw"Response\W+([0-9]+)\W+([/A-Za-z0-9]+|-)\W+([/A-Za-z0-9]+|-)\W+([/A-Za-z0-9]+|-)".r
 
   private def performRequest[T](reqFn: Int => Try[T]): Try[T] =
@@ -209,7 +209,11 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
             Failure(NotLeaderError())
           case ResponsePattern(requestIdStr, _, data, _) =>
             assert(requestIdStr.toInt == requestId)
-            Success(safelyDecodeBytes(data))
+            if(data == "-") {
+              Failure(NotFoundError())
+            } else {
+              Success(safelyDecodeBytes(data))
+            }
         }
       } yield result
     }
@@ -246,6 +250,8 @@ object VardClient {
       clientId = None)
 
   case class NotLeaderError() extends RuntimeException
+
+  case class NotFoundError() extends RuntimeException
 
   // -- here lies very basic testing code ---
 
