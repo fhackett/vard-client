@@ -18,6 +18,30 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
   private val clientId: String = config.clientId.getOrElse(
     UUID.randomUUID().toString.replace("-",""))
 
+  private implicit final class ChannelHelpers(channel: SocketChannel) {
+    def writeAll(buffer: ByteBuffer): Unit = {
+      val expectedBytes = buffer.remaining()
+      val actualBytes = Iterator.continually {
+        channel.write(buffer)
+      }
+        .scanLeft(0)(_ + _)
+        .find(_ == expectedBytes)
+        .get
+      assert(expectedBytes == actualBytes)
+    }
+
+    def readAll(buffer: ByteBuffer): Unit = {
+      val expectedBytes = buffer.remaining()
+      val actualBytes = Iterator.continually {
+        channel.read(buffer)
+      }
+        .scanLeft(0)(_ + _)
+        .find(_ == expectedBytes)
+        .get
+      assert(expectedBytes == actualBytes)
+    }
+  }
+
   private object socket {
     private val random = new Random()
     private var socketChannel: Option[SocketChannel] = None
@@ -35,8 +59,8 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
           .flip()
 
         val expectedBytesWritten = lenBuffer.remaining() + msgsRemaining
-        val bytesWritten = socketChannel.write(Array(lenBuffer, msg))
-        assert(bytesWritten == expectedBytesWritten)
+        socketChannel.writeAll(lenBuffer)
+        socketChannel.writeAll(msg)
 
         socketChannel
       }
@@ -90,8 +114,7 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
       Try(socketChannel.get)
         .map { socketChannel =>
           lenBuffer.clear()
-          val lenBytesRead = socketChannel.read(lenBuffer)
-          assert(lenBytesRead == 4)
+          socketChannel.readAll(lenBuffer)
           val responseLen = lenBuffer.flip().getInt()
 
           if(responseBuffer.capacity() < responseLen) {
@@ -105,8 +128,7 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
             .clear()
             .limit(responseLen)
 
-          val respBytesRead = socketChannel.read(responseBuffer)
-          assert(respBytesRead == responseLen)
+          socketChannel.readAll(responseBuffer)
 
           responseBuffer.flip()
           StandardCharsets.UTF_8.decode(responseBuffer)
