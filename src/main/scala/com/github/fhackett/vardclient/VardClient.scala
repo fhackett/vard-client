@@ -1,11 +1,12 @@
 package com.github.fhackett.vardclient
 
+import com.github.fhackett.vardclient.VardClient.NotLeaderError
+
 import java.math.BigInteger
 import java.net.{InetSocketAddress, SocketException}
 import java.nio.{ByteBuffer, ByteOrder, CharBuffer}
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
-import java.util.UUID
 import scala.collection.mutable
 import scala.util.{Failure, Random, Success, Try}
 
@@ -14,7 +15,7 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
     case (host, port) => new InetSocketAddress(host, port)
   }
   private val clientId: String = config.clientId.getOrElse(
-    UUID.randomUUID().toString.replace("-",""))
+    new Random().nextInt(Int.MaxValue).toString)
 
   private implicit final class ChannelHelpers(channel: SocketChannel) {
     def writeAll(buffer: ByteBuffer): Unit = {
@@ -45,7 +46,7 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
     private var socketChannel: Option[SocketChannel] = None
 
     private val lenBuffer = ByteBuffer
-      .allocateDirect(4)
+      .allocate(4)
       .order(ByteOrder.LITTLE_ENDIAN)
 
     private def sendImpl(socketChannel: SocketChannel, msg: ByteBuffer): Try[SocketChannel] =
@@ -56,7 +57,6 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
           .putInt(msgsRemaining)
           .flip()
 
-        val expectedBytesWritten = lenBuffer.remaining() + msgsRemaining
         socketChannel.writeAll(lenBuffer)
         socketChannel.writeAll(msg)
 
@@ -72,67 +72,99 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
         endpointAddrs.iterator.take(startIdx)
     }
 
-    private def findSocketChannel(): Try[SocketChannel] =
-      socketChannel
-        .map(Success(_))
-        .getOrElse {
-          Try {
-            var lastErr: Option[Throwable] = None
-
-            val channelOpt: Option[SocketChannel] = endpointsIter
-              .collectFirst(Function.unlift { addr =>
-                val result = Try(SocketChannel.open(addr))
-                  .flatMap(sendImpl(_, encodedClientId.rewind()))
-
-                result.failed.foreach { err =>
-                  lastErr = Some(err)
-                }
-
-                result.toOption
-              })
-
-            if (channelOpt.isEmpty) {
-              throw new AssertionError("could not connect to any endpoints", lastErr.get)
-            }
-
-            socketChannel = channelOpt
-            channelOpt.get
+    private def findSocketChannel[T](fn: SocketChannel => Try[T]): Try[T] = {
+      val possibleSockets = endpointsIter
+        .map { addr =>
+          println(s"try connecting to $addr")
+          Try(SocketChannel.open(addr)).map { channel =>
+            socketChannel = Some(channel)
+            channel
           }
         }
 
-    def send(msg: String): Try[Unit] =
-      findSocketChannel()
-        .flatMap(sendImpl(_, StandardCharsets.UTF_8.encode(msg)))
-        .map(_ => ())
+      var lastErr: Option[Throwable] = None
 
-    private var responseBuffer: ByteBuffer = ByteBuffer.allocateDirect(64)
-
-    def recv(): Try[String] = {
-      assert(socketChannel.nonEmpty)
-      Try(socketChannel.get)
-        .map { socketChannel =>
-          lenBuffer.clear()
-          socketChannel.readAll(lenBuffer)
-          val responseLen = lenBuffer.flip().getInt()
-
-          if(responseBuffer.capacity() < responseLen) {
-            if(responseBuffer.capacity() * 2 < responseLen) {
-              responseBuffer = ByteBuffer.allocateDirect(responseLen)
-            } else {
-              responseBuffer = ByteBuffer.allocateDirect(responseBuffer.capacity() * 2)
+      val resultOpt = (socketChannel.map(Success(_)).iterator ++ possibleSockets)
+        .map {  tryChannel =>
+          if(config.ivyMode) {
+            //println("ivy mode: skip sending client ID, send as prefix instead")
+            tryChannel
+          } else {
+            tryChannel.flatMap { channel =>
+              //println("sending client ID...")
+              sendImpl(channel, encodedClientId.rewind())
             }
           }
-          responseBuffer
-            .clear()
-            .limit(responseLen)
-
-          socketChannel.readAll(responseBuffer)
-
-          responseBuffer.flip()
-          StandardCharsets.UTF_8.decode(responseBuffer)
-            .toString
         }
+        .map(_.flatMap { channel =>
+          fn(channel)
+            .map((_, channel))
+        })
+        .tapEach { tryChannel =>
+          if(tryChannel.isFailure) {
+            drop()
+          }
+        }
+        .find {
+          case Failure(err@NotLeaderError()) =>
+            println("not leader...")
+            lastErr = Some(err)
+            false
+          case Failure(err: SocketException) =>
+            println("failed to connect:")
+            err.printStackTrace()
+            lastErr = Some(err)
+            false
+          case Failure(_) => true
+          case Success(_) => true
+        }
+
+      resultOpt match {
+        case None =>
+          throw new AssertionError("could not connect to any endpoints", lastErr.get)
+        case Some(tryResult) =>
+          tryResult.map {
+            case (result, channel) =>
+              socketChannel = Some(channel)
+              result
+          }
+      }
     }
+
+    def proc[T](msg: String)(fn: String => Try[T]): Try[T] =
+      findSocketChannel { channel =>
+        for {
+          _ <- sendImpl(channel, StandardCharsets.UTF_8.encode(msg))
+          response <- recvImpl(channel)
+          result <- fn(response)
+        } yield result
+      }
+
+    private var responseBuffer: ByteBuffer = ByteBuffer.allocate(64)
+
+    private def recvImpl(channel: SocketChannel): Try[String] =
+      Try {
+        lenBuffer.clear()
+        channel.readAll(lenBuffer)
+        val responseLen = lenBuffer.flip().getInt()
+
+        if(responseBuffer.capacity() < responseLen) {
+          if(responseBuffer.capacity() * 2 < responseLen) {
+            responseBuffer = ByteBuffer.allocate(responseLen)
+          } else {
+            responseBuffer = ByteBuffer.allocate(responseBuffer.capacity() * 2)
+          }
+        }
+        responseBuffer
+          .clear()
+          .limit(responseLen)
+
+        channel.readAll(responseBuffer)
+
+        responseBuffer.flip()
+        StandardCharsets.UTF_8.decode(responseBuffer)
+          .toString
+      }
 
     def drop(): Unit = {
       socketChannel.foreach(_.close())
@@ -161,80 +193,42 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
 
   private val ResponsePattern = raw"Response\W+([0-9]+)\W+([/A-Za-z0-9]+|-)\W+([/A-Za-z0-9]+|-)\W+([/A-Za-z0-9]+|-)".r
 
-  private def performRequest[T](reqFn: Int => Try[T]): Try[T] =
-    Iterator.continually {
-      requestId += 1
-      reqFn(requestId)
-    }
-      .find {
-        case Success(_) => true
-        case Failure(NotLeaderError()) => false
-        case Failure(_: SocketException) =>
-          socket.drop()
-          false
-        case Failure(_) => true
-      }
-      .get
+  private val clientIdPrefix = if(config.ivyMode) s"$clientId " else ""
 
   def put(key: ByteBuffer, value: ByteBuffer): Try[Unit] = {
     key.mark(); value.mark()
-    performRequest { requestId =>
-      key.reset()
-      value.reset()
-      for {
-        _ <- socket.send(s"$requestId PUT ${safelyEncodeBytes(key)} ${safelyEncodeBytes(value)} -")
-        resp <- socket.recv()
-        _ <- resp match {
-          case s"NotLeader$_" =>
-            socket.drop()
-            Failure(NotLeaderError())
-          case ResponsePattern(requestIdStr, _, _, _) =>
-            assert(requestIdStr.toInt == requestId)
-            Success(())
-        }
-      } yield ()
+    requestId += 1
+    socket.proc(s"$clientIdPrefix$requestId PUT ${safelyEncodeBytes(key)} ${safelyEncodeBytes(value)} -") {
+      case s"NotLeader$_" => Failure(NotLeaderError())
+      case ResponsePattern(requestIdStr, _, _, _) =>
+        assert(requestIdStr.toInt == requestId)
+        Success(())
     }
   }
 
   def get(key: ByteBuffer): Try[ByteBuffer] = {
     key.mark()
-    performRequest { requestId =>
-      key.reset()
-      for {
-        _ <- socket.send(s"$requestId GET ${safelyEncodeBytes(key)} - -")
-        resp <- socket.recv()
-        result <- resp match {
-          case s"NotLeader$_" =>
-            socket.drop()
-            Failure(NotLeaderError())
-          case ResponsePattern(requestIdStr, _, data, _) =>
-            assert(requestIdStr.toInt == requestId)
-            if(data == "-") {
-              Failure(NotFoundError())
-            } else {
-              Success(safelyDecodeBytes(data))
-            }
+    requestId += 1
+    socket.proc(s"$clientIdPrefix$requestId GET ${safelyEncodeBytes(key)} - -") {
+      case s"NotLeader$_" => Failure(NotLeaderError())
+      case ResponsePattern(requestIdStr, _, data, _) =>
+        assert(requestIdStr.toInt == requestId)
+        if(data == "-") {
+          Failure(NotFoundError())
+        } else {
+          Success(safelyDecodeBytes(data))
         }
-      } yield result
     }
   }
 
   def del(key: ByteBuffer): Try[Unit] = {
     key.mark()
-    performRequest { requestId =>
-      key.reset()
-      for {
-        _ <- socket.send(s"$requestId DEL ${safelyEncodeBytes(key)} - -")
-        resp <- socket.recv()
-        _ <- resp match {
-          case s"NotLeader$_" =>
-            socket.drop()
-            Failure(NotLeaderError())
-          case ResponsePattern(requestIdStr, _, _, _) =>
-            assert(requestIdStr.toInt == requestId)
-            Success(())
-        }
-      } yield ()
+    requestId += 1
+    socket.proc(s"$clientIdPrefix$requestId DEL ${safelyEncodeBytes(key)} - -") {
+      case s"NotLeader$_" => Failure(NotLeaderError())
+      case ResponsePattern(requestIdStr, _, _, _) =>
+        assert(requestIdStr.toInt == requestId)
+        Success(())
     }
   }
 
@@ -247,7 +241,8 @@ object VardClient {
     VardClientBuilder(
       endpoints = Nil,
       timeout = 50,
-      clientId = None)
+      clientId = None,
+      ivyMode = false)
 
   case class NotLeaderError() extends RuntimeException
 

@@ -4,7 +4,8 @@ import scala.annotation.tailrec
 
 final case class VardClientBuilder private[vardclient] (private[vardclient] val endpoints: List[(String,Int)],
                                                         private[vardclient] val timeout: Int,
-                                                        private[vardclient] val clientId: Option[String]) {
+                                                        private[vardclient] val clientId: Option[String],
+                                                        private[vardclient] val ivyMode: Boolean) {
   def withEndpoint(host: String, port: Int): VardClientBuilder =
     copy(endpoints = (host, port) +: endpoints)
 
@@ -34,6 +35,9 @@ final case class VardClientBuilder private[vardclient] (private[vardclient] val 
 
   def withClientId(clientId: String): VardClientBuilder =
     copy(clientId = Some(clientId))
+
+  def withIvyMode(ivyMode: Boolean): VardClientBuilder =
+    copy(ivyMode = ivyMode)
 
   def build: VardClient =
     new VardClient(this)
