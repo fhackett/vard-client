@@ -190,20 +190,26 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
 
   private var requestId = 0
 
-  private def safelyEncodeBytes(bytes: ByteBuffer): String = {
-    val byteArrayBuilder = mutable.ArrayBuilder.make[Byte]
-    byteArrayBuilder += 1
-    while(bytes.remaining() > 0) {
-      byteArrayBuilder += bytes.get()
+  private def safelyEncodeBytes(bytes: ByteBuffer): String =
+    if(config.rawUTF8) {
+      StandardCharsets.UTF_8.decode(bytes).toString
+    } else {
+      val byteArrayBuilder = mutable.ArrayBuilder.make[Byte]
+      byteArrayBuilder += 1
+      while (bytes.remaining() > 0) {
+        byteArrayBuilder += bytes.get()
+      }
+      new BigInteger(1, byteArrayBuilder.result())
+        .toString(36)
     }
-    new BigInteger(1, byteArrayBuilder.result())
-      .toString(36)
-  }
 
-  private def safelyDecodeBytes(str: String): ByteBuffer = {
-    val bytes = new BigInteger(str, 36).toByteArray
-    ByteBuffer.wrap(bytes, 1, bytes.length - 1)
-  }
+  private def safelyDecodeBytes(str: String): ByteBuffer =
+    if(config.rawUTF8) {
+      StandardCharsets.UTF_8.encode(str)
+    } else {
+      val bytes = new BigInteger(str, 36).toByteArray
+      ByteBuffer.wrap(bytes, 1, bytes.length - 1)
+    }
 
   import VardClient._
 
@@ -258,7 +264,8 @@ object VardClient {
       endpoints = Nil,
       timeout = 50,
       clientId = None,
-      ivyMode = false)
+      ivyMode = false,
+      rawUTF8 = false)
 
   case class NotLeaderError() extends RuntimeException
 
@@ -273,6 +280,7 @@ object VardClient {
       VardClient
         .builder
         .withEndpoints("localhost:4000,localhost:4001")
+        .withRawUTF8(true)
 
     Using(builder.build) { client =>
       for {
