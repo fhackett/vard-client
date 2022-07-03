@@ -7,15 +7,29 @@ import java.net.{InetSocketAddress, SocketException}
 import java.nio.{ByteBuffer, ByteOrder, CharBuffer}
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
+import java.util.UUID
 import scala.collection.mutable
 import scala.util.{Failure, Random, Success, Try}
 
 final class VardClient private[vardclient](config: VardClientBuilder) extends AutoCloseable {
+  private val random = new Random()
   private val endpointAddrs = config.endpoints.map {
     case (host, port) => new InetSocketAddress(host, port)
   }
-  private val clientId: String = config.clientId.getOrElse(
-    new Random().nextInt(Int.MaxValue).toString)
+  private val clientId: String = config.clientId.getOrElse {
+    if(config.ivyMode) {
+      random
+        .nextInt(Int.MaxValue)
+        .toString
+    } else {
+      // vard's parser uses a regex that specifically only accepts a UUID without dashes.
+      // no other string (including differences in length) is acceptable.
+      UUID
+        .randomUUID()
+        .toString
+        .replace("-", "")
+    }
+  }
 
   private implicit final class ChannelHelpers(channel: SocketChannel) {
     def writeAll(buffer: ByteBuffer): Unit = {
@@ -42,7 +56,6 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
   }
 
   private object socket {
-    private val random = new Random()
     private var socketChannel: Option[SocketChannel] = None
 
     private val lenBuffer = ByteBuffer
@@ -56,6 +69,10 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
           .clear()
           .putInt(msgsRemaining)
           .flip()
+
+        val mark = msg.position()
+        //println(s"send ${StandardCharsets.UTF_8.decode(msg).toString}")
+        msg.position(mark)
 
         socketChannel.writeAll(lenBuffer)
         socketChannel.writeAll(msg)
@@ -76,26 +93,23 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
       val possibleSockets = endpointsIter
         .map { addr =>
           println(s"try connecting to $addr")
-          Try(SocketChannel.open(addr)).map { channel =>
-            socketChannel = Some(channel)
-            channel
-          }
+          Try(SocketChannel.open(addr))
+            .map { channel =>
+              socketChannel = Some(channel)
+              channel
+            }
+            .flatMap { channel =>
+              if(config.ivyMode) {
+                Success(channel)
+              } else {
+                sendImpl(channel, encodedClientId.rewind())
+              }
+            }
         }
 
       var lastErr: Option[Throwable] = None
 
       val resultOpt = (socketChannel.map(Success(_)).iterator ++ possibleSockets)
-        .map {  tryChannel =>
-          if(config.ivyMode) {
-            //println("ivy mode: skip sending client ID, send as prefix instead")
-            tryChannel
-          } else {
-            tryChannel.flatMap { channel =>
-              //println("sending client ID...")
-              sendImpl(channel, encodedClientId.rewind())
-            }
-          }
-        }
         .map(_.flatMap { channel =>
           fn(channel)
             .map((_, channel))
@@ -162,8 +176,10 @@ final class VardClient private[vardclient](config: VardClientBuilder) extends Au
         channel.readAll(responseBuffer)
 
         responseBuffer.flip()
-        StandardCharsets.UTF_8.decode(responseBuffer)
+        val resp = StandardCharsets.UTF_8.decode(responseBuffer)
           .toString
+        //println(s"recv $resp")
+        resp
       }
 
     def drop(): Unit = {
@@ -256,7 +272,7 @@ object VardClient {
     val builder =
       VardClient
         .builder
-        .withEndpoints("localhost:8000,localhost:8001")
+        .withEndpoints("localhost:4000,localhost:4001")
 
     Using(builder.build) { client =>
       for {
